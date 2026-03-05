@@ -10,12 +10,9 @@ app = Flask(__name__)
 # ---------------------------
 # Load models safely
 # ---------------------------
-# NOTE: Update these paths based on where your .pkl files are.
-# If your repo has a folder named "models" and the pkl files are inside it, keep as is.
-# If your pkl files are in the repo root, change to: "xgb_model.pkl" and "dt_model.pkl"
+# Your models are in repo root as per your setting:
 XGB_MODEL_PATH = "xgb_model.pkl"
 DT_MODEL_PATH = "dt_model.pkl"
-
 
 try:
     xgb_model = joblib.load(XGB_MODEL_PATH)
@@ -29,7 +26,7 @@ except Exception as e:
 
 
 # ---------------------------
-# Home route (professional)
+# Home route (simple + professional)
 # ---------------------------
 @app.route("/", methods=["GET"])
 def home():
@@ -37,10 +34,99 @@ def home():
         "api": "Carrier SLA Risk Prediction API",
         "status": "running",
         "endpoints": {
+            "ui": "/ui",
             "single_prediction": "/predict",
             "batch_prediction": "/predict/batch"
         }
     })
+
+
+# ---------------------------
+# Simple UI route
+# ---------------------------
+@app.route("/ui", methods=["GET"])
+def ui():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Carrier SLA Risk API - Simple UI</title>
+</head>
+<body style="font-family: Arial, sans-serif; max-width: 900px; margin: 20px;">
+  <h2>Carrier SLA Risk Prediction (Simple UI)</h2>
+
+  <p><b>Single Prediction</b> (JSON object)</p>
+  <textarea id="singleInput" rows="10" style="width: 100%;"></textarea><br/>
+  <button onclick="singlePredict()">Predict (Single)</button>
+
+  <hr/>
+
+  <p><b>Batch Prediction</b> (JSON array of objects)</p>
+  <textarea id="batchInput" rows="10" style="width: 100%;"></textarea><br/>
+  <button onclick="batchPredict()">Predict (Batch)</button>
+
+  <hr/>
+
+  <p><b>Result</b></p>
+  <pre id="result" style="background:#f6f6f6; padding:10px; border:1px solid #ddd; white-space: pre-wrap;"></pre>
+
+  <script>
+    async function singlePredict() {
+      const resultEl = document.getElementById("result");
+      resultEl.textContent = "Running...";
+      try {
+        const payload = JSON.parse(document.getElementById("singleInput").value);
+        const res = await fetch("/predict", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        const text = await res.text();
+        resultEl.textContent = text;
+      } catch (e) {
+        resultEl.textContent = "Error: " + e.message;
+      }
+    }
+
+    async function batchPredict() {
+      const resultEl = document.getElementById("result");
+      resultEl.textContent = "Running...";
+      try {
+        const payload = JSON.parse(document.getElementById("batchInput").value);
+        const res = await fetch("/predict/batch", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        const text = await res.text();
+        resultEl.textContent = text;
+      } catch (e) {
+        resultEl.textContent = "Error: " + e.message;
+      }
+    }
+
+    // Optional: Paste your real feature JSON here for quick testing.
+    // If you already have single.json and batch.json in your repo, copy their content into these boxes.
+    document.getElementById("singleInput").value = JSON.stringify({
+      "paste_your_feature_1": 0,
+      "paste_your_feature_2": 0
+    }, null, 2);
+
+    document.getElementById("batchInput").value = JSON.stringify([
+      {
+        "paste_your_feature_1": 0,
+        "paste_your_feature_2": 0
+      },
+      {
+        "paste_your_feature_1": 0,
+        "paste_your_feature_2": 0
+      }
+    ], null, 2);
+  </script>
+</body>
+</html>
+"""
 
 
 # ---------------------------
@@ -122,3 +208,4 @@ def predict_batch():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
