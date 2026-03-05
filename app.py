@@ -9,38 +9,42 @@ from business_logic import risk_bucket
 app = Flask(__name__)
 
 # =====================================================
-# LOAD MODELS (FROM ROOT FOLDER - IMPORTANT)
+# LOAD MODELS (FROM ROOT)
 # =====================================================
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 XGB_MODEL_PATH = os.path.join(BASE_DIR, "xgb_model.pkl")
 DT_MODEL_PATH  = os.path.join(BASE_DIR, "dt_model.pkl")
 
+xgb_model, dt_model = None, None
+
 try:
     xgb_model = joblib.load(XGB_MODEL_PATH)
-    print("XGB model loaded successfully")
+    print("✅ XGBoost model loaded")
 except Exception as e:
-    print("Error loading XGB model:", e)
-    xgb_model = None
+    print("❌ XGBoost model load error:", e)
 
 try:
     dt_model = joblib.load(DT_MODEL_PATH)
-    print("DT model loaded successfully")
+    print("✅ DecisionTree model loaded")
 except Exception as e:
-    print("Error loading DT model:", e)
-    dt_model = None
+    print("❌ DecisionTree model load error:", e)
 
+if xgb_model is None and dt_model is None:
+    raise RuntimeError("No models could be loaded. Check xgb_model.pkl / dt_model.pkl in repo root.")
 
 # =====================================================
-# EXPECTED COLUMNS
+# EXPECTED COLS: IMPORTANT
 # =====================================================
-
 EXPECTED_COLS = None
 
 if xgb_model is not None and hasattr(xgb_model, "feature_names_in_"):
     EXPECTED_COLS = list(xgb_model.feature_names_in_)
 
+elif dt_model is not None and hasattr(dt_model, "feature_names_in_"):
+    EXPECTED_COLS = list(dt_model.feature_names_in_)
+
+# fallback only if both models don't expose feature_names_in_
 if not EXPECTED_COLS:
     EXPECTED_COLS = [
         "shipment_id", "carrier", "shipping_mode", "region",
@@ -53,33 +57,23 @@ if not EXPECTED_COLS:
         "shipment_value_usd", "insurance_flag"
     ]
 
-
 # =====================================================
 # HELPERS
 # =====================================================
+NUMERIC_HINTS = ("_flag", "_days", "_pct", "_kg", "_cbm", "_usd")
 
-def guess_input_type(col):
+def is_numeric_feature(col: str) -> bool:
     c = col.lower()
-    if (
-        c.endswith("_flag")
-        or c.endswith("_days")
-        or c.endswith("_pct")
-        or c.endswith("_kg")
-        or c.endswith("_cbm")
-        or c.endswith("_usd")
-    ):
-        return "number"
-    return "text"
+    return any(c.endswith(s) for s in NUMERIC_HINTS)
 
-
-def coerce_value(col, val):
+def coerce_value(col: str, val):
+    """Convert input values safely."""
     if val is None:
         val = ""
 
     val = str(val).strip()
-    t = guess_input_type(col)
 
-    if t == "number":
+    if is_numeric_feature(col):
         if val == "":
             return 0
         try:
@@ -89,34 +83,76 @@ def coerce_value(col, val):
     else:
         return val
 
+def sanitize_row(data: dict):
+    """Return a single-row dict for EXPECTED_COLS with correct types."""
+    row = {}
+    for col in EXPECTED_COLS:
+        row[col] = coerce_value(col, data.get(col))
+    return row
 
-def predict_from_df(df):
+def align_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Force model-required columns and correct order."""
+    for col in EXPECTED_COLS:
+        if col not in df.columns:
+            df[col] = 0 if is_numeric_feature(col) else ""
+    df = df.reindex(columns=EXPECTED_COLS, fill_value=0)
+    return df
 
+def get_probability(df: pd.DataFrame):
+    """Try XGB first then DT."""
     if xgb_model is not None:
         try:
-            prob = float(xgb_model.predict_proba(df)[0][1])
-            model_used = "XGBoost"
-        except:
-            prob = float(dt_model.predict_proba(df)[0][1])
-            model_used = "DecisionTree"
+            p = float(xgb_model.predict_proba(df)[0][1])
+            return p, "XGBoost"
+        except Exception as e:
+            print("⚠️ XGB predict failed, fallback to DT:", e)
+
+    if dt_model is not None:
+        p = float(dt_model.predict_proba(df)[0][1])
+        return p, "DecisionTree"
+
+    raise RuntimeError("No available model for prediction.")
+
+def build_explanation(row: dict):
+    """Rule-based explanation (works even without SHAP)."""
+    reasons = []
+
+    delay = float(row.get("delivery_delay_days", 0) or 0)
+    customs = float(row.get("customs_delay_flag", 0) or 0)
+    weather = float(row.get("weather_disruption_flag", 0) or 0)
+    actual = float(row.get("actual_delivery_days", 0) or 0)
+    planned = float(row.get("planned_delivery_days", 0) or 0)
+    fuel = float(row.get("fuel_surcharge_pct", 0) or 0)
+    priority = float(row.get("priority_flag", 0) or 0)
+
+    # Key driver reasons
+    if delay >= 3:
+        reasons.append(f"Delivery delay is high ({delay} days), increasing breach likelihood.")
+    elif delay > 0:
+        reasons.append(f"Delivery delay exists ({delay} days), slightly increasing risk.")
     else:
-        prob = float(dt_model.predict_proba(df)[0][1])
-        model_used = "DecisionTree"
+        reasons.append("No delivery delay detected, supporting low breach risk.")
 
-    bucket, action = risk_bucket(prob)
+    if actual > planned and planned > 0:
+        reasons.append(f"Actual delivery days ({actual}) > planned ({planned}), indicating schedule overrun.")
 
-    return {
-        "model_used": model_used,
-        "sla_breach_probability": round(prob, 3),
-        "risk_bucket": bucket,
-        "business_action": action
-    }
+    if customs == 1:
+        reasons.append("Customs delay flag is ON, which often increases SLA breach risk.")
 
+    if weather == 1:
+        reasons.append("Weather disruption flag is ON, which can increase SLA breach risk.")
+
+    if fuel >= 15:
+        reasons.append(f"Fuel surcharge is high ({fuel}%), indicating cost pressure and possible delays.")
+
+    if priority == 1:
+        reasons.append("Priority shipment: usually handled faster, which can reduce risk.")
+
+    return reasons
 
 # =====================================================
 # ROUTES
 # =====================================================
-
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
@@ -124,130 +160,262 @@ def home():
         "status": "running",
         "ui": "/ui",
         "single_prediction": "/predict",
-        "batch_prediction": "/predict/batch"
+        "batch_prediction": "/predict/batch",
+        "debug": "/debug/last-input"
     })
 
+# store last input for debugging
+LAST_INPUT = {"received": None, "aligned_columns": None}
+
+@app.route("/debug/last-input", methods=["GET"])
+def debug_last():
+    return jsonify(LAST_INPUT)
 
 @app.route("/ui", methods=["GET"])
 def ui():
-
     inputs_html = []
 
     for col in EXPECTED_COLS:
-        input_type = guess_input_type(col)
+        input_type = "number" if is_numeric_feature(col) else "text"
         step_attr = ' step="any"' if input_type == "number" else ""
+        placeholder = "0" if input_type == "number" else f"Enter {col}"
 
         inputs_html.append(f"""
         <div class="row">
-            <label>{html.escape(col)}</label>
-            <input name="{html.escape(col)}" type="{input_type}"{step_attr} />
+          <label for="{html.escape(col)}">{html.escape(col)}</label>
+          <input id="{html.escape(col)}" name="{html.escape(col)}" type="{input_type}"{step_attr} placeholder="{html.escape(placeholder)}" />
         </div>
         """)
 
     page = f"""
-    <html>
-    <head>
-    <title>Carrier SLA Risk Prediction</title>
-    <style>
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Carrier SLA Risk Prediction</title>
+  <style>
     body {{
-        font-family: Arial;
-        max-width: 900px;
-        margin: auto;
-        padding: 20px;
+      font-family: Arial, sans-serif;
+      max-width: 980px;
+      margin: 20px auto;
+      padding: 0 16px;
+      background: #fafafa;
     }}
+    .card {{
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+      background: #fff;
+    }}
+    h2 {{ margin: 0 0 8px 0; }}
     .row {{
-        display: grid;
-        grid-template-columns: 300px 1fr;
-        gap: 10px;
-        margin-bottom: 8px;
+      display: grid;
+      grid-template-columns: 330px 1fr;
+      gap: 12px;
+      align-items: center;
+      padding: 6px 0;
     }}
+    label {{ font-weight: 600; }}
     input {{
-        padding: 6px;
+      padding: 8px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      width: 100%;
+    }}
+    .actions {{
+      margin-top: 12px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
     }}
     button {{
-        padding: 8px 12px;
-        margin-top: 10px;
+      padding: 10px 14px;
+      border: 1px solid #333;
+      background: #111;
+      color: #fff;
+      border-radius: 8px;
+      cursor: pointer;
     }}
-    pre {{
-        background: #f4f4f4;
-        padding: 10px;
-        margin-top: 20px;
+    button.secondary {{
+      background: #fff;
+      color: #111;
     }}
-    </style>
-    </head>
-    <body>
-
+    .result-box {{
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 14px;
+      background: #fcfcfc;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .kv {{
+      border: 1px solid #eee;
+      padding: 10px;
+      border-radius: 10px;
+      background: #fff;
+    }}
+    .kv .k {{ font-size: 12px; color: #666; }}
+    .kv .v {{ font-size: 18px; font-weight: 700; }}
+    ul {{ margin: 10px 0 0 18px; }}
+    .small {{
+      font-size: 12px;
+      color: #555;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
     <h2>Carrier SLA Risk Prediction</h2>
+    <div class="small">
+      Tip: Leave numeric fields empty → treated as 0. Use delay/customs/weather flags to test high-risk cases.
+    </div>
+  </div>
 
-    <form id="form">
-        {''.join(inputs_html)}
-        <button type="button" onclick="predict()">Predict</button>
+  <div class="card">
+    <form id="predForm">
+      {''.join(inputs_html)}
+      <div class="actions">
+        <button type="button" onclick="submitPredict()">Predict</button>
+        <button type="button" class="secondary" onclick="resetForm()">Clear</button>
+      </div>
     </form>
+  </div>
 
-    <pre id="result"></pre>
+  <div class="card">
+    <h3>Result</h3>
+    <div id="result" class="result-box">No prediction yet.</div>
+  </div>
 
-    <script>
-    async function predict() {{
-        const form = document.getElementById("form");
-        const data = new FormData(form);
-        let obj = {{}};
-        for (let [k, v] of data.entries()) {{
-            obj[k] = v;
-        }}
+<script>
+function resetForm() {{
+  document.getElementById('predForm').reset();
+  document.getElementById('result').innerHTML = "No prediction yet.";
+}}
 
-        const res = await fetch("/predict", {{
-            method: "POST",
-            headers: {{"Content-Type": "application/json"}},
-            body: JSON.stringify(obj)
-        }});
+function fmtPct(x) {{
+  try {{
+    const v = parseFloat(x);
+    return (v * 100).toFixed(1) + "%";
+  }} catch(e) {{
+    return x;
+  }}
+}}
 
-        const text = await res.text();
-        document.getElementById("result").textContent = text;
+async function submitPredict() {{
+  const resultEl = document.getElementById("result");
+  resultEl.innerHTML = "Running...";
+
+  const form = document.getElementById("predForm");
+  const data = new FormData(form);
+
+  const payload = {{}};
+  for (const [k, v] of data.entries()) {{
+    payload[k] = v;
+  }}
+
+  try {{
+    const res = await fetch("/ui/predict", {{
+      method: "POST",
+      headers: {{"Content-Type":"application/json"}},
+      body: JSON.stringify(payload)
+    }});
+
+    const out = await res.json();
+
+    if (!res.ok) {{
+      resultEl.innerHTML = "<b>Error:</b> " + (out.error || "Unknown error");
+      return;
     }}
-    </script>
 
-    </body>
-    </html>
-    """
+    resultEl.innerHTML = `
+      <div class="grid">
+        <div class="kv"><div class="k">Model Used</div><div class="v">${{out.model_used}}</div></div>
+        <div class="kv"><div class="k">SLA Breach Probability</div><div class="v">${{fmtPct(out.sla_breach_probability)}}</div></div>
+        <div class="kv"><div class="k">Risk Bucket</div><div class="v">${{out.risk_bucket}}</div></div>
+        <div class="kv"><div class="k">Business Action</div><div class="v">${{out.business_action}}</div></div>
+      </div>
 
+      <h4 style="margin-top:14px;">Why this result?</h4>
+      <ul>
+        ${(out.explanations || []).map(x => `<li>${{x}}</li>`).join("")}
+      </ul>
+
+      <div class="small" style="margin-top:10px;">
+        Debug: If probability always stays 0%, open <b>/debug/last-input</b> to verify what the model received.
+      </div>
+    `;
+  }} catch (e) {{
+    resultEl.innerHTML = "<b>Error:</b> " + e.message;
+  }}
+}}
+</script>
+</body>
+</html>
+"""
     return page
 
+@app.route("/ui/predict", methods=["POST"])
+def ui_predict():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid input"}), 400
+
+    row = sanitize_row(data)
+    df = pd.DataFrame([row])
+    df = align_df(df)
+
+    # store debug
+    LAST_INPUT["received"] = row
+    LAST_INPUT["aligned_columns"] = list(df.columns)
+
+    prob, model_used = get_probability(df)
+    bucket, action = risk_bucket(prob)
+    explanations = build_explanation(row)
+
+    return jsonify({
+        "model_used": model_used,
+        "sla_breach_probability": round(prob, 4),
+        "risk_bucket": bucket,
+        "business_action": action,
+        "explanations": explanations
+    })
 
 @app.route("/predict", methods=["POST"])
 def predict():
-
-    data = request.get_json()
-
+    data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return jsonify({"error": "Invalid JSON"}), 400
+        return jsonify({"error": "Invalid JSON. Send a JSON object."}), 400
 
-    row = {}
-    for col in EXPECTED_COLS:
-        row[col] = coerce_value(col, data.get(col))
-
+    row = sanitize_row(data)
     df = pd.DataFrame([row])
+    df = align_df(df)
 
-    result = predict_from_df(df)
+    prob, model_used = get_probability(df)
+    bucket, action = risk_bucket(prob)
 
-    return jsonify(result)
-
+    return jsonify({
+        "model_used": model_used,
+        "sla_breach_probability": round(prob, 4),
+        "risk_bucket": bucket,
+        "business_action": action,
+        "explanations": build_explanation(row)
+    })
 
 @app.route("/predict/batch", methods=["POST"])
 def predict_batch():
-
-    data = request.get_json()
-
-    if not isinstance(data, list):
-        return jsonify({"error": "Send list of JSON objects"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, list) or len(data) == 0:
+        return jsonify({"error": "Invalid JSON. Send a list of objects."}), 400
 
     df = pd.DataFrame(data)
+    df = align_df(df)
 
-    for col in EXPECTED_COLS:
-        if col not in df.columns:
-            df[col] = 0 if guess_input_type(col) == "number" else ""
-
-    df = df[EXPECTED_COLS]
-
+    # Try XGB then fallback
     if xgb_model is not None:
         try:
             probs = xgb_model.predict_proba(df)[:, 1]
@@ -260,23 +428,25 @@ def predict_batch():
         model_used = "DecisionTree"
 
     results = []
+    for i, p in enumerate(probs):
+        p = float(p)
+        bucket, action = risk_bucket(p)
 
-    for p in probs:
-        bucket, action = risk_bucket(float(p))
+        # build explanation from row i if possible
+        row_dict = df.iloc[i].to_dict()
         results.append({
             "model_used": model_used,
-            "sla_breach_probability": round(float(p), 3),
+            "sla_breach_probability": round(p, 4),
             "risk_bucket": bucket,
-            "business_action": action
+            "business_action": action,
+            "explanations": build_explanation(row_dict)
         })
 
     return jsonify(results)
 
-
 # =====================================================
 # ENTRY POINT
 # =====================================================
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
