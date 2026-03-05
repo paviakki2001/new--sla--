@@ -11,8 +11,8 @@ app = Flask(__name__)
 # ---------------------------
 # Load models (repo root)
 # ---------------------------
-XGB_MODEL_PATH = "xgb_model.pkl"
-DT_MODEL_PATH = "dt_model.pkl"
+XGB_MODEL_PATH = os.path.join("models", "xgb_model.pkl")
+DT_MODEL_PATH  = os.path.join("models", "dt_model.pkl")
 
 # Get expected input columns from model (pipeline)
 EXPECTED_COLS = None
@@ -317,3 +317,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
 
     app.run(host="0.0.0.0", port=port)
+
