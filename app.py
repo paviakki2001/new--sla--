@@ -14,9 +14,6 @@ app = Flask(__name__)
 XGB_MODEL_PATH = "xgb_model.pkl"
 DT_MODEL_PATH = "dt_model.pkl"
 
-xgb_model = joblib.load(XGB_MODEL_PATH)
-dt_model = joblib.load(DT_MODEL_PATH)
-
 # Get expected input columns from model (pipeline)
 EXPECTED_COLS = None
 if hasattr(xgb_model, "feature_names_in_"):
@@ -318,4 +315,5 @@ def predict_batch():
 # Render / local entrypoint
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+
     app.run(host="0.0.0.0", port=port)
